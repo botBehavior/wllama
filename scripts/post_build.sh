@@ -7,9 +7,11 @@ cd $CURRENT_PATH/..
 
 mkdir -p esm/single-thread
 mkdir -p esm/multi-thread
+mkdir -p esm/webgpu
 
 cp src/multi-thread/wllama.wasm  esm/multi-thread
 cp src/single-thread/wllama.wasm esm/single-thread
+cp src/webgpu/wllama.wasm        esm/webgpu
 
 # https://stackoverflow.com/questions/62619058/appending-js-extension-on-relative-import-statements-during-typescript-compilat
 

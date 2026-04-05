@@ -37,7 +37,10 @@ export const formatChat = async (
   messages: Message[]
 ): Promise<string> => {
   const templateStr = modelWllama.getChatTemplate() ?? DEFAULT_CHAT_TEMPLATE;
-  // dirty patch for DeepSeek model (crash on @huggingface/jinja)
+  // Direct formatting for models whose templates use Jinja features
+  // not supported by @huggingface/jinja (e.g. macros)
+
+  // DeepSeek R1
   const isDeepSeekR1 =
     templateStr.match(/<｜Assistant｜>/) &&
     templateStr.match(/<｜User｜>/) &&
@@ -55,21 +58,43 @@ export const formatChat = async (
     }
     return result + '<｜Assistant｜>';
   }
-  const template = new Template(templateStr);
-  const bos_token: string = await modelWllama.detokenize(
-    [modelWllama.getBOS()],
-    true
-  );
-  const eos_token: string = await modelWllama.detokenize(
-    [modelWllama.getEOS()],
-    true
-  );
-  return template.render({
-    messages,
-    bos_token,
-    eos_token,
-    add_generation_prompt: true,
-  });
+
+  // Gemma (template uses macros which @huggingface/jinja can't parse)
+  const isGemma =
+    templateStr.includes('<start_of_turn>') ||
+    templateStr.includes('<|turn>');
+  if (isGemma) {
+    let result = '';
+    for (const message of messages) {
+      result += `<start_of_turn>${message.role}\n${message.content}<end_of_turn>\n`;
+    }
+    return result + '<start_of_turn>model\n';
+  }
+  try {
+    const template = new Template(templateStr);
+    const bos_token: string = await modelWllama.detokenize(
+      [modelWllama.getBOS()],
+      true
+    );
+    const eos_token: string = await modelWllama.detokenize(
+      [modelWllama.getEOS()],
+      true
+    );
+    return template.render({
+      messages,
+      bos_token,
+      eos_token,
+      add_generation_prompt: true,
+    });
+  } catch (e) {
+    // Fallback to ChatML when @huggingface/jinja can't handle the template
+    console.warn('Jinja template failed, using ChatML fallback:', (e as Error)?.message);
+    let result = '';
+    for (const message of messages) {
+      result += `<|im_start|>${message.role}\n${message.content}<|im_end|>\n`;
+    }
+    return result + '<|im_start|>assistant\n';
+  }
 };
 
 export const toHumanReadableSize = (bytes: number): string => {

@@ -461,15 +461,12 @@ glue_msg_decode_res action_decode(app_t &app, const char *req_raw)
   PARSE_REQ(glue_msg_decode_req);
   llama_tokens tokens_list = std::move(req.tokens.arr);
   bool skip_logits = req.skip_logits.value;
-  size_t i = 0;
   wcommon_batch_clear(app.batch);
-  for (auto id : tokens_list)
+  for (size_t i = 0; i < tokens_list.size(); i++)
   {
-    bool grp_attn_enabled = false; // TODO: maybe remove grp_attn
-    int32_t n_past = app.tokens.size();
+    auto id = tokens_list[i];
+    int32_t n_past = app.tokens.size() + i;
     wcommon_batch_add(app.batch, id, n_past, {0}, false);
-    app.tokens.push_back(id);
-    i++;
   }
   // llama_decode will output logits only for the last token of the prompt
   if (!skip_logits)
@@ -479,12 +476,18 @@ glue_msg_decode_res action_decode(app_t &app, const char *req_raw)
   glue_msg_decode_res res;
   if (llama_decode(app.ctx, app.batch) != 0)
   {
+    // Do NOT update app.tokens — decode failed, KV cache is unchanged
     res.success.value = false;
     res.message.value = "llama_decode failed, maybe n_batch is too small?";
     res.n_past.value = app.tokens.size();
   }
   else
   {
+    // Only track tokens after successful decode
+    for (auto id : tokens_list)
+    {
+      app.tokens.push_back(id);
+    }
     res.success.value = true;
     res.n_past.value = app.tokens.size();
   }

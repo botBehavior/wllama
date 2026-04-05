@@ -188,13 +188,22 @@ const patchMEMFS = () => {
   m.FS.mount(m.MEMFS, { root: '.' }, '/models');
 };
 
+// Convert BigInt to Number (needed for memory64 where pointers are BigInt)
+const toNum = (v) => typeof v === 'bigint' ? Number(v) : v;
+
 // Allocate a new file in wllama heapfs, returns file ID
 const heapfsAlloc = (name, size) => {
   if (size < 1) {
     throw new Error('File size must be bigger than 0');
   }
   const m = Module;
-  const ptr = m.mmapAlloc(size);
+  const sizeMB = (size / 1024 / 1024).toFixed(1);
+  msg({ verb: 'console.debug', args: [`heapfsAlloc: allocating ${sizeMB} MiB for "${name}"`] });
+  const ptr = toNum(m.mmapAlloc(size));
+  if (!ptr) {
+    throw new Error(`heapfsAlloc: failed to allocate ${sizeMB} MiB for "${name}". WASM heap may be too small.`);
+  }
+  msg({ verb: 'console.debug', args: [`heapfsAlloc: allocated at ptr=${ptr}`] });
   const file = {
     ptr: ptr,
     size: size,
@@ -228,21 +237,54 @@ const heapfsWrite = (id, buffer, offset) => {
 //////////////////////////////////////////////////////////////
 
 const callWrapper = (name, ret, args) => {
-  const fn = Module.cwrap(name, ret, args);
+  const fn = Module.cwrap(name, ret, args, { async: true });
   return async (action, req) => {
     let result;
     try {
       if (args.length === 2) {
         result = await fn(action, req);
       } else {
-        result = fn();
+        result = await fn();
       }
     } catch (ex) {
-      console.error(ex);
-      throw ex;
+      let errMsg;
+
+      // Try Emscripten's getExceptionMessage for both legacy (number) and wasm exceptions
+      if (Module.getExceptionMessage) {
+        try {
+          const [type, message] = Module.getExceptionMessage(ex);
+          errMsg = `${type}: ${message}`;
+        } catch (e2) {
+          // getExceptionMessage didn't work for this exception type
+        }
+      }
+
+      if (!errMsg && typeof ex === 'number') {
+        try {
+          if (Module.UTF8ToString) {
+            const whatPtr = new Uint32Array(Module.HEAPU8.buffer, ex + 8, 1)[0];
+            if (whatPtr) errMsg = Module.UTF8ToString(whatPtr);
+          }
+        } catch (e2) {}
+        if (!errMsg) errMsg = `C++ exception (ptr=${ex})`;
+      }
+
+      if (!errMsg) {
+        errMsg = ex?.message || String(ex);
+      }
+      msg({ verb: 'console.error', args: [`[C++ exception in ${name}] ${errMsg}`] });
+      throw new Error(errMsg);
     }
     return result;
   };
+};
+
+// Global error handler to catch Emscripten abort and unhandled errors
+self.onerror = (event) => {
+  msg({ verb: 'console.error', args: ['[Worker unhandled error]', String(event)] });
+};
+self.onunhandledrejection = (event) => {
+  msg({ verb: 'console.error', args: ['[Worker unhandled rejection]', event.reason?.message || String(event.reason)] });
 };
 
 onmessage = async (e) => {
@@ -258,21 +300,24 @@ onmessage = async (e) => {
     const argMainScriptBlob = args[0];
     try {
       Module = getWModuleConfig(argMainScriptBlob);
+      // Capture Emscripten's abort with message
+      Module.onAbort = (what) => {
+        msg({ verb: 'signal.abort', args: [String(what || 'Emscripten abort (no message)')] });
+      };
       Module.onRuntimeInitialized = () => {
         // async call once module is ready
         // init FS
         patchMEMFS();
         // init cwrap
-        const pointer = 'number';
-        // TODO: note sure why emscripten cannot bind if there is only 1 argument
-        wllamaMalloc = callWrapper('wllama_malloc', pointer, [
-          'number',
-          pointer,
+        // Use 'pointer' type for memory64 compatibility (BigInt conversion)
+        wllamaMalloc = callWrapper('wllama_malloc', 'pointer', [
+          'pointer', // size_t (64-bit in wasm64)
+          'number',  // uint32_t
         ]);
         wllamaStart = callWrapper('wllama_start', 'string', []);
-        wllamaAction = callWrapper('wllama_action', pointer, [
+        wllamaAction = callWrapper('wllama_action', 'pointer', [
           'string',
-          pointer,
+          'pointer',
         ]);
         wllamaExit = callWrapper('wllama_exit', 'string', []);
         wllamaDebug = callWrapper('wllama_debug', 'string', []);
@@ -280,7 +325,7 @@ onmessage = async (e) => {
       };
       wModuleInit();
     } catch (err) {
-      msg({ callbackId, err });
+      msg({ callbackId, err: err?.message || String(err) });
     }
     return;
   }
@@ -303,7 +348,7 @@ onmessage = async (e) => {
       const fileId = heapfsAlloc(argFilename, argSize);
       msg({ callbackId, result: { fileId } });
     } catch (err) {
-      msg({ callbackId, err });
+      msg({ callbackId, err: err?.message || String(err) });
     }
     return;
   }
@@ -316,7 +361,7 @@ onmessage = async (e) => {
       const writtenBytes = heapfsWrite(argFileId, argBuffer, argOffset);
       msg({ callbackId, result: { writtenBytes } });
     } catch (err) {
-      msg({ callbackId, err });
+      msg({ callbackId, err: err?.message || String(err) });
     }
     return;
   }
@@ -326,7 +371,7 @@ onmessage = async (e) => {
       const result = await wllamaStart();
       msg({ callbackId, result });
     } catch (err) {
-      msg({ callbackId, err });
+      msg({ callbackId, err: err?.message || String(err) });
     }
     return;
   }
@@ -343,7 +388,12 @@ onmessage = async (e) => {
         argEncodedMsg.byteLength
       );
       inputBuffer.set(argEncodedMsg, 0);
+      msg({ verb: 'console.debug', args: [`wllama.action: ${argAction} (${argEncodedMsg.byteLength} bytes)`] });
       const outputPtr = await wllamaAction(argAction, inputPtr);
+      // null return means C++ threw an exception (already logged via stderr)
+      if (!outputPtr) {
+        throw new Error(`wllama_action("${argAction}") returned null`);
+      }
       // length of output buffer is written at the first 4 bytes of input buffer
       const outputLen = new Uint32Array(Module.HEAPU8.buffer, inputPtr, 1)[0];
       // copy the output buffer to JS heap
@@ -356,7 +406,7 @@ onmessage = async (e) => {
       outputBuffer.set(outputSrcView, 0); // copy it
       msg({ callbackId, result: outputBuffer }, [outputBuffer.buffer]);
     } catch (err) {
-      msg({ callbackId, err });
+      msg({ callbackId, err: err?.message || String(err) });
     }
     return;
   }
@@ -366,7 +416,7 @@ onmessage = async (e) => {
       const result = await wllamaExit();
       msg({ callbackId, result });
     } catch (err) {
-      msg({ callbackId, err });
+      msg({ callbackId, err: err?.message || String(err) });
     }
     return;
   }
@@ -376,7 +426,7 @@ onmessage = async (e) => {
       const result = await wllamaDebug();
       msg({ callbackId, result });
     } catch (err) {
-      msg({ callbackId, err });
+      msg({ callbackId, err: err?.message || String(err) });
     }
     return;
   }

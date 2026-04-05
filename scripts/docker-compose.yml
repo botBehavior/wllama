@@ -6,7 +6,9 @@ services:
       dockerfile_inline: |
         ARG EMSDK_IMAGE_TAG=none  # modify it in build_wasm.sh
         FROM emscripten/emsdk:$${EMSDK_IMAGE_TAG}
-        RUN apt update && apt install -y git
+        RUN apt update && apt install -y git python3 unzip
+        RUN curl -L -o /tmp/emdawnwebgpu.zip https://github.com/google/dawn/releases/download/v20260403.135149/emdawnwebgpu_pkg-v20260403.135149.zip \
+            && mkdir -p /emdawnwebgpu && cd /emdawnwebgpu && unzip /tmp/emdawnwebgpu.zip && rm /tmp/emdawnwebgpu.zip
       args:
         EMSDK_IMAGE_TAG: ${EMSDK_IMAGE_TAG}
     user: "${D_UID}:${D_GID}"
@@ -22,11 +24,11 @@ services:
         mkdir -p wasm/single-thread
         cd wasm/single-thread
 
-        export SHARED_EMCC_CFLAGS="--no-entry -O3 -msimd128 -DNDEBUG -flto=full -frtti -fwasm-exceptions -sEXPORT_ALL=1 -sEXPORT_ES6=0 -sMODULARIZE=0 -sINITIAL_MEMORY=128MB -sMAXIMUM_MEMORY=4096MB -sALLOW_MEMORY_GROWTH=1 -sFORCE_FILESYSTEM=1 -sEXPORTED_FUNCTIONS=_main,_wllama_malloc,_wllama_start,_wllama_action,_wllama_exit,_wllama_debug -sEXPORTED_RUNTIME_METHODS=ccall,cwrap -sNO_EXIT_RUNTIME=1"
+        export SHARED_EMCC_CFLAGS="--no-entry -O3 -msimd128 -DNDEBUG -flto=full -frtti -fwasm-exceptions -sEXPORT_ALL=1 -sEXPORT_ES6=0 -sMODULARIZE=0 -sINITIAL_MEMORY=128MB -sMAXIMUM_MEMORY=4096MB -sALLOW_MEMORY_GROWTH=1 -sFORCE_FILESYSTEM=1 -sEXPORTED_FUNCTIONS=_main,_wllama_malloc,_wllama_start,_wllama_action,_wllama_exit,_wllama_debug -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8 -sNO_EXIT_RUNTIME=1"
 
         # emcc --clear-cache
 
-        emcmake cmake ../..
+        emcmake cmake ../.. -DLLAMA_WASM_MEM64=OFF
         export EMCC_CFLAGS="$$SHARED_EMCC_CFLAGS"
         emmake make wllama -j
 
@@ -34,8 +36,21 @@ services:
         mkdir -p wasm/multi-thread
         cd wasm/multi-thread
         export EMCC_CFLAGS="" # temporary clear it
-        emcmake cmake ../..
+        emcmake cmake ../.. -DLLAMA_WASM_MEM64=OFF
         export EMCC_CFLAGS="$$SHARED_EMCC_CFLAGS -pthread -sUSE_PTHREADS=1 -sPTHREAD_POOL_SIZE=Module[\\\"pthreadPoolSize\\\"]"
+        emmake make wllama -j
+
+        # go back to root
+        cd ../..
+
+        # build webgpu target
+        # WebGPU uses wasm64 (MEMORY64) + JSPI for >2GB model support and async GPU ops
+        # Drops -flto=full and uses -O2 to avoid wasm-ld issues with large binaries
+        mkdir -p wasm/webgpu
+        cd wasm/webgpu
+        export EMCC_CFLAGS="" # temporary clear it
+        emcmake cmake ../.. -DGGML_WEBGPU=ON -DGGML_WEBGPU_JSPI=ON -DEMDAWNWEBGPU_DIR=/emdawnwebgpu/emdawnwebgpu_pkg
+        export EMCC_CFLAGS="--no-entry -O2 -msimd128 -DNDEBUG -frtti -fwasm-exceptions -sMEMORY64=1 -sEXPORT_ALL=1 -sEXPORT_ES6=0 -sMODULARIZE=0 -sINITIAL_MEMORY=128MB -sMAXIMUM_MEMORY=8GB -sALLOW_MEMORY_GROWTH=1 -sFORCE_FILESYSTEM=1 -sEXPORTED_FUNCTIONS=_main,_wllama_malloc,_wllama_start,_wllama_action,_wllama_exit,_wllama_debug -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,getExceptionMessage,UTF8ToString -sNO_EXIT_RUNTIME=1 -sJSPI_EXPORTS=main,wllama_malloc,wllama_start,wllama_action,wllama_exit,wllama_debug"
         emmake make wllama -j
 
         # go back to root
@@ -44,6 +59,7 @@ services:
         # list files
         echo "wasm/single-thread"; ls -lh wasm/single-thread
         echo "wasm/multi-thread";  ls -lh wasm/multi-thread
+        echo "wasm/webgpu";        ls -lh wasm/webgpu
 
         # copy output files
         mkdir -p src/multi-thread
@@ -51,3 +67,6 @@ services:
         cp wasm/multi-thread/wllama.wasm       src/multi-thread
         cp wasm/single-thread/wllama.js        src/single-thread
         cp wasm/single-thread/wllama.wasm      src/single-thread
+        mkdir -p src/webgpu
+        cp wasm/webgpu/wllama.js               src/webgpu
+        cp wasm/webgpu/wllama.wasm             src/webgpu

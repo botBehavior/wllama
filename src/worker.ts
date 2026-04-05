@@ -18,6 +18,7 @@ import {
   LLAMA_CPP_WORKER_CODE,
   WLLAMA_MULTI_THREAD_CODE,
   WLLAMA_SINGLE_THREAD_CODE,
+  WLLAMA_WEBGPU_CODE,
 } from './workers-code/generated';
 
 interface Logger {
@@ -57,17 +58,20 @@ export class ProxyToWorker {
   worker?: Worker;
   pathConfig: any;
   multiThread: boolean;
+  webgpu: boolean;
   nbThread: number;
 
   constructor(
     pathConfig: any,
     nbThread: number = 1,
     suppressNativeLog: boolean,
-    logger: Logger
+    logger: Logger,
+    webgpu: boolean = false
   ) {
     this.pathConfig = pathConfig;
     this.nbThread = nbThread;
     this.multiThread = nbThread > 1;
+    this.webgpu = webgpu;
     this.logger = logger;
     this.suppressNativeLog = suppressNativeLog;
   }
@@ -76,9 +80,11 @@ export class ProxyToWorker {
     if (!this.pathConfig['wllama.wasm']) {
       throw new Error('"single-thread/wllama.wasm" is missing from pathConfig');
     }
-    let moduleCode = this.multiThread
-      ? WLLAMA_MULTI_THREAD_CODE
-      : WLLAMA_SINGLE_THREAD_CODE;
+    let moduleCode = this.webgpu
+      ? WLLAMA_WEBGPU_CODE
+      : this.multiThread
+        ? WLLAMA_MULTI_THREAD_CODE
+        : WLLAMA_SINGLE_THREAD_CODE;
     let mainModuleCode = moduleCode.replace('var Module', 'var ___Module');
     const runOptions = {
       pathConfig: this.pathConfig,

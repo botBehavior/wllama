@@ -178,6 +178,46 @@ const isSupportSIMD = async () =>
   );
 
 /**
+ * @returns true if browser supports WebGPU
+ */
+export const isSupportWebGPU = async (): Promise<boolean> => {
+  if (typeof navigator === 'undefined' || !navigator.gpu) return false;
+  try {
+    const adapter = await navigator.gpu.requestAdapter();
+    return !!adapter;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * @returns true if browser supports WebAssembly memory64 (required for wasm64 builds)
+ */
+export const isSupportMemory64 = async (): Promise<boolean> => {
+  try {
+    // Minimal wasm module with a memory64 (i64-indexed) memory
+    await WebAssembly.compile(
+      new Uint8Array([
+        0x00, 0x61, 0x73, 0x6d, // magic
+        0x01, 0x00, 0x00, 0x00, // version 1
+        0x05, 0x04, 0x01,       // memory section, size=4, 1 entry
+        0x05, 0x01, 0x01,       // flags=0x05 (memory64 + has_max), min=1, max=1
+      ])
+    );
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * @returns true if browser supports JSPI (JS Promise Integration for WebAssembly)
+ */
+export const isSupportJSPI = (): boolean => {
+  return typeof WebAssembly.promising === 'function';
+};
+
+/**
  * Throws an error if the environment is not compatible
  */
 export const checkEnvironmentCompatible = async (): Promise<void> => {

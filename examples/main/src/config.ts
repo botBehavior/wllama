@@ -1,6 +1,7 @@
 // See: https://vitejs.dev/guide/assets#explicit-url-imports
 import wllamaSingle from '@wllama/wllama/src/single-thread/wllama.wasm?url';
 import wllamaMulti from '@wllama/wllama/src/multi-thread/wllama.wasm?url';
+import wllamaWebGPU from '@wllama/wllama/src/webgpu/wllama.wasm?url';
 import wllamaPackageJson from '@wllama/wllama/package.json';
 import { InferenceParams } from './utils/types';
 
@@ -9,11 +10,16 @@ export const WLLAMA_VERSION = wllamaPackageJson.version;
 export const WLLAMA_CONFIG_PATHS = {
   'single-thread/wllama.wasm': wllamaSingle,
   'multi-thread/wllama.wasm': wllamaMulti,
+  'webgpu/wllama.wasm': wllamaWebGPU,
 };
 
-export const MAX_GGUF_SIZE = 2 * 1024 * 1024 * 1024; // 2GB
+export const MAX_GGUF_SIZE = 4 * 1024 * 1024 * 1024; // 4GB
 
 export const LIST_MODELS = [
+  {
+    url: 'https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_0.gguf',
+    size: 3041371520,
+  },
   {
     url: 'https://huggingface.co/LiquidAI/LFM2-350M-GGUF/resolve/main/LFM2-350M-Q4_K_M.gguf',
     size: 229309376,

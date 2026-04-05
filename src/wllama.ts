@@ -5,7 +5,10 @@ import {
   cbToAsyncIter,
   checkEnvironmentCompatible,
   isString,
+  isSupportJSPI,
+  isSupportMemory64,
   isSupportMultiThread,
+  isSupportWebGPU,
   joinBuffers,
   sortFileByShard,
   isValidGgufFile,
@@ -84,6 +87,7 @@ export interface WllamaChatMessage {
 export interface AssetsPathConfig {
   'single-thread/wllama.wasm': string;
   'multi-thread/wllama.wasm'?: string;
+  'webgpu/wllama.wasm'?: string;
 }
 
 export interface LoadModelConfig {
@@ -94,6 +98,8 @@ export interface LoadModelConfig {
   n_threads?: number;
   embeddings?: boolean;
   offload_kqv?: boolean;
+  // number of layers to offload to GPU (WebGPU only). Default: 99 (all layers) when WebGPU is active
+  n_gpu_layers?: number;
   pooling_type?:
     | 'LLAMA_POOLING_TYPE_UNSPECIFIED'
     | 'LLAMA_POOLING_TYPE_NONE'
@@ -281,6 +287,7 @@ export class Wllama {
   private config: WllamaConfig;
   private pathConfig: AssetsPathConfig;
   private useMultiThread: boolean = false;
+  private useWebGPU: boolean = false;
   private nbThreads: number = 1;
   private useEmbeddings: boolean = false;
   // available when loaded
@@ -341,6 +348,15 @@ export class Wllama {
    */
   isModelLoaded(): boolean {
     return !!this.proxy && !!this.metadata;
+  }
+
+  /**
+   * Get the active backend type
+   */
+  getBackendType(): 'webgpu' | 'multi-thread' | 'single-thread' {
+    if (this.useWebGPU) return 'webgpu';
+    if (this.useMultiThread) return 'multi-thread';
+    return 'single-thread';
   }
 
   /**
@@ -555,7 +571,22 @@ export class Wllama {
     if (this.proxy) {
       throw new WllamaError('Module is already initialized', 'load_error');
     }
-    // detect if we can use multi-thread
+    // detect best available backend: WebGPU > multi-thread > single-thread
+    // WebGPU build requires memory64 + JSPI (wasm64 build)
+    const hasPathWebGPU = !!this.pathConfig['webgpu/wllama.wasm'];
+    const gpuAvailable = hasPathWebGPU && (await isSupportWebGPU());
+    const mem64Available = gpuAvailable && (await isSupportMemory64());
+    const jspiAvailable = gpuAvailable && isSupportJSPI();
+    const supportWebGPU = gpuAvailable && mem64Available && jspiAvailable;
+    if (hasPathWebGPU && !supportWebGPU) {
+      const missing = [];
+      if (!gpuAvailable) missing.push('WebGPU');
+      if (!mem64Available) missing.push('memory64');
+      if (!jspiAvailable) missing.push('JSPI');
+      this.logger().warn(
+        `WebGPU backend unavailable (missing: ${missing.join(', ')}), falling back to CPU`
+      );
+    }
     const supportMultiThread = await isSupportMultiThread();
     if (!supportMultiThread) {
       this.logger().warn(
@@ -571,24 +602,34 @@ export class Wllama {
     const hwConccurency = Math.floor((navigator.hardwareConcurrency || 1) / 2);
     const nbThreads = config.n_threads ?? hwConccurency;
     this.nbThreads = nbThreads;
+    this.useWebGPU = supportWebGPU;
     this.useMultiThread =
-      supportMultiThread && hasPathMultiThread && nbThreads > 1;
-    const mPathConfig = this.useMultiThread
-      ? {
-          'wllama.wasm': absoluteUrl(
-            this.pathConfig['multi-thread/wllama.wasm']!!
-          ),
-        }
-      : {
-          'wllama.wasm': absoluteUrl(
-            this.pathConfig['single-thread/wllama.wasm']
-          ),
-        };
+      !this.useWebGPU && supportMultiThread && hasPathMultiThread && nbThreads > 1;
+    let mPathConfig: { 'wllama.wasm': string };
+    if (this.useWebGPU) {
+      mPathConfig = {
+        'wllama.wasm': absoluteUrl(this.pathConfig['webgpu/wllama.wasm']!!),
+      };
+      this.logger().log('Using WebGPU backend');
+    } else if (this.useMultiThread) {
+      mPathConfig = {
+        'wllama.wasm': absoluteUrl(
+          this.pathConfig['multi-thread/wllama.wasm']!!
+        ),
+      };
+    } else {
+      mPathConfig = {
+        'wllama.wasm': absoluteUrl(
+          this.pathConfig['single-thread/wllama.wasm']
+        ),
+      };
+    }
     this.proxy = new ProxyToWorker(
       mPathConfig,
       this.useMultiThread ? nbThreads : 1,
       this.config.suppressNativeLog ?? false,
-      this.logger()
+      this.logger(),
+      this.useWebGPU
     );
     const modelFiles = blobs.map((blob, i) => ({
       name: `model-${i}.gguf`,
@@ -607,7 +648,7 @@ export class Wllama {
       _name: 'load_req',
       use_mmap: true,
       use_mlock: true,
-      n_gpu_layers: 0, // not supported for now
+      n_gpu_layers: this.useWebGPU ? (config.n_gpu_layers ?? 99) : 0,
       seed: config.seed || Math.floor(Math.random() * 100000),
       n_ctx: config.n_ctx || 1024,
       n_threads: this.useMultiThread ? nbThreads : 1,
@@ -1279,20 +1320,80 @@ export class Wllama {
     this.checkModelLoaded();
     const roles = messages.map((m) => m.role);
     const contents = messages.map((m) => m.content);
-    const result = await this.proxy.wllamaAction<GlueMsgChatFormatRes>(
-      'chat_format',
-      {
-        _name: 'cfmt_req',
-        roles,
-        contents,
-        tmpl: template,
-        add_ass: addAssistant,
+    try {
+      const result = await this.proxy.wllamaAction<GlueMsgChatFormatRes>(
+        'chat_format',
+        {
+          _name: 'cfmt_req',
+          roles,
+          contents,
+          tmpl: template,
+          add_ass: addAssistant,
+        }
+      );
+      if (!result.success) {
+        throw new WllamaError('formatChat unknown error');
       }
-    );
-    if (!result.success) {
-      throw new WllamaError('formatChat unknown error');
+      return result.formatted_chat;
+    } catch (e) {
+      // C++ template engine doesn't support complex Jinja (e.g. macros).
+      // Fall back to JS-side formatting using detected template style.
+      this.logger().warn(
+        `C++ chat template failed (${(e as Error)?.message}), using JS fallback`
+      );
+      return this.formatChatJS(messages, addAssistant);
     }
-    return result.formatted_chat;
+  }
+
+  /**
+   * JS-side chat formatter for templates not supported by the C++ Jinja engine.
+   * Detects the model's template style and applies it directly.
+   */
+  private formatChatJS(
+    messages: WllamaChatMessage[],
+    addAssistant: boolean
+  ): string {
+    const tmpl = this.chatTemplate ?? '';
+    let out = '';
+
+    if (tmpl.includes('<start_of_turn>') || tmpl.includes('<|turn>')) {
+      // Gemma-style: <start_of_turn>role\ncontent<end_of_turn>\n
+      for (const msg of messages) {
+        out += `<start_of_turn>${msg.role}\n${msg.content}<end_of_turn>\n`;
+      }
+      if (addAssistant) {
+        out += '<start_of_turn>model\n';
+      }
+    } else if (tmpl.includes('<|im_start|>')) {
+      // ChatML-style
+      for (const msg of messages) {
+        out += `<|im_start|>${msg.role}\n${msg.content}<|im_end|>\n`;
+      }
+      if (addAssistant) {
+        out += '<|im_start|>assistant\n';
+      }
+    } else if (tmpl.includes('[INST]')) {
+      // Mistral/Llama2-style
+      for (const msg of messages) {
+        if (msg.role === 'user') {
+          out += `[INST] ${msg.content} [/INST]`;
+        } else if (msg.role === 'assistant') {
+          out += `${msg.content}</s>`;
+        } else if (msg.role === 'system') {
+          out += `<<SYS>>\n${msg.content}\n<</SYS>>\n\n`;
+        }
+      }
+    } else {
+      // Generic fallback: ChatML
+      for (const msg of messages) {
+        out += `<|im_start|>${msg.role}\n${msg.content}<|im_end|>\n`;
+      }
+      if (addAssistant) {
+        out += '<|im_start|>assistant\n';
+      }
+    }
+
+    return out;
   }
 
   /**
